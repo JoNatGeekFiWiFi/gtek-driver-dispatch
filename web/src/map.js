@@ -128,6 +128,30 @@ export function removeCrashLayer(map, id) {
   if (map.getSource(id)) map.removeSource(id);
 }
 
+// Numbered stop markers for a route. `arrived` is a map of visited stop
+// indices; `targetIdx` is the stop the driver is currently heading to.
+// Reuses a per-map marker array so repeated calls don't leak markers.
+export function setStopMarkers(map, stops, { arrived = {}, targetIdx = -1 } = {}) {
+  if (!map.__stopMarkers) map.__stopMarkers = [];
+  map.__stopMarkers.forEach((m) => m.remove());
+  map.__stopMarkers = [];
+  const last = stops.length - 1;
+  stops.forEach((s, i) => {
+    if (s.lat == null || s.lng == null) return;
+    const isStart = i === 0, isEnd = i === last;
+    const state = arrived[i] || isStart ? 'done' : i === targetIdx ? 'current' : 'upcoming';
+    const glyph = isStart ? '◆' : isEnd ? '■' : i;
+    const el = document.createElement('div');
+    el.className = `stop-marker ${state}`;
+    el.textContent = glyph;
+    const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+      .setLngLat([s.lng, s.lat])
+      .setPopup(new maplibregl.Popup({ offset: 16 }).setText(s.name || `Stop ${i}`))
+      .addTo(map);
+    map.__stopMarkers.push(marker);
+  });
+}
+
 export function makeMarker(map, lngLat, { color, label, html } = {}) {
   let el;
   if (html) {

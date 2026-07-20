@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, openWs, clearSession, getUser, fmtMiles, fmtDuration, fmtAgo } from '../api.js';
+import { api, openWs, clearSession, getUser, fmtMiles, fmtDuration, fmtAgo, fmtClock } from '../api.js';
 import { createMap, setLineLayer, setCrashLayer, removeCrashLayer, makeMarker } from '../map.js';
 
 const POINT_COLORS = { first: '#2ecc71', last: '#e74c3c', mid: '#2f7df6' };
@@ -28,6 +28,7 @@ export default function Dispatch() {
   const [drivers, setDrivers] = useState([]);
   const [routes, setRoutes] = useState([]);
   const [livePos, setLivePos] = useState({});
+  const [alerts, setAlerts] = useState([]); // recent stop events / behind alerts
   const [crashOverlay, setCrashOverlay] = useState(false);
   const [dataStats, setDataStats] = useState({ stats: [], states: [] });
   const [providers, setProviders] = useState(null);
@@ -57,6 +58,13 @@ export default function Dispatch() {
     setPoints((pts) => [...pts, p]);
     setPlan(null);
     setSearchResults([]);
+  }
+
+  // Edit a stop's dwell limit / deadline; invalidate the plan so the schedule
+  // is recomputed before saving.
+  function updatePoint(i, patch) {
+    setPoints((pts) => pts.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+    setPlan(null);
   }
 
   // keep point markers in sync
@@ -126,6 +134,8 @@ export default function Dispatch() {
         });
       } else if (m.type === 'route_status' || m.type === 'route_assigned') {
         refreshRoutes();
+      } else if (m.type === 'stop_event') {
+        setAlerts((prev) => [{ ...m, id: `${m.driverId}-${m.ts}` }, ...prev].slice(0, 30));
       }
     });
     return () => ws?.close();
@@ -199,6 +209,7 @@ export default function Dispatch() {
           durationTrafficS: plan.durationTrafficS,
           hazard: plan.hazard,
           provider: plan.provider,
+          schedule: plan.schedule,
           driverId: assignTo ? Number(assignTo) : null,
           scheduledStart: plan.departAt,
         },
@@ -287,6 +298,32 @@ export default function Dispatch() {
         <div className="sidebar-body">
           {msg && <div className={msg.kind}>{msg.text}</div>}
 
+          {alerts.length > 0 && (
+            <div className="card" style={{ borderColor: alerts.some((a) => a.kind === 'behind') ? 'var(--red)' : 'var(--border)' }}>
+              <h3 style={{ display: 'flex', justifyContent: 'space-between' }}>
+                Live alerts
+                <button className="btn link" style={{ padding: 0 }} onClick={() => setAlerts([])}>clear</button>
+              </h3>
+              <div className="alert-feed">
+                {alerts.slice(0, 8).map((a) => (
+                  <div key={a.id} className={`alert-line ${a.kind}`}>
+                    <span className="alert-icon">{a.kind === 'behind' ? '⚠' : a.kind === 'arrived' ? '●' : '→'}</span>
+                    <span className="alert-text">
+                      <b>{a.driverName}</b>{' '}
+                      {a.kind === 'behind'
+                        ? `running behind${a.delayMin ? ` ~${a.delayMin}m` : ''}${a.stopName ? ` (before ${a.stopName})` : ''}`
+                        : a.kind === 'arrived'
+                        ? `arrived at ${a.stopName || `stop ${a.stopIndex}`}${a.auto ? '' : ' (manual)'}`
+                        : `departed ${a.stopName || `stop ${a.stopIndex}`}`}
+                      {a.note ? ` — “${a.note}”` : ''}
+                    </span>
+                    <span className="alert-time">{fmtAgo(a.ts)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {tab === 'build' && (
             <>
               <div className="card">
@@ -306,18 +343,42 @@ export default function Dispatch() {
                   </ul>
                 )}
                 <ul className="point-list">
-                  {points.map((p, i) => (
-                    <li key={i}>
-                      <span
-                        className="dot"
-                        style={{ background: i === 0 ? POINT_COLORS.first : i === points.length - 1 && points.length > 1 ? POINT_COLORS.last : POINT_COLORS.mid }}
-                      />
-                      <span className="name" title={p.name}>
-                        {i === 0 ? 'Start: ' : i === points.length - 1 ? 'End: ' : `Stop ${i}: `}{p.name}
-                      </span>
-                      <button className="x" onClick={() => { setPoints(points.filter((_, j) => j !== i)); setPlan(null); }}>✕</button>
+                  {points.map((p, i) => {
+                    const isStart = i === 0;
+                    const isEnd = i === points.length - 1 && points.length > 1;
+                    return (
+                    <li key={i} className="stop-row">
+                      <div className="stop-head">
+                        <span
+                          className="dot"
+                          style={{ background: isStart ? POINT_COLORS.first : isEnd ? POINT_COLORS.last : POINT_COLORS.mid }}
+                        />
+                        <span className="name" title={p.name}>
+                          {isStart ? 'Start: ' : isEnd ? 'End: ' : `Stop ${i}: `}{p.name}
+                        </span>
+                        <button className="x" onClick={() => { setPoints(points.filter((_, j) => j !== i)); setPlan(null); }}>✕</button>
+                      </div>
+                      {!isStart && (
+                        <div className="stop-limits">
+                          {!isEnd && (
+                            <label className="mini">Time limit
+                              <span className="with-unit">
+                                <input type="number" min="0" placeholder="—"
+                                  value={p.timeLimitMin ?? ''}
+                                  onChange={(e) => updatePoint(i, { timeLimitMin: e.target.value === '' ? null : Number(e.target.value) })} />
+                                <span>min</span>
+                              </span>
+                            </label>
+                          )}
+                          <label className="mini">Arrive by (optional)
+                            <input type="time"
+                              value={p.deadline ?? ''}
+                              onChange={(e) => updatePoint(i, { deadline: e.target.value || null })} />
+                          </label>
+                        </div>
+                      )}
                     </li>
-                  ))}
+                  );})}
                 </ul>
                 <label>Departure time
                   <input type="datetime-local" value={departAt} onChange={(e) => setDepartAt(e.target.value)} />
@@ -369,6 +430,27 @@ export default function Dispatch() {
                       {plan.departureProfile.map((p, i) => <span key={i}>{i % 2 === 0 ? p.hourLabel : ''}</span>)}
                     </div>
                   </div>
+                  {plan.schedule?.length > 0 && (
+                    <div style={{ marginTop: 12 }}>
+                      <div className="label muted" style={{ fontSize: 11 }}>PLANNED SCHEDULE</div>
+                      <table className="sched-table">
+                        <tbody>
+                          {plan.schedule.map((s, i) => (
+                            <tr key={i}>
+                              <td className="sched-name" title={s.name}>
+                                {i === 0 ? 'Start' : i === plan.schedule.length - 1 ? 'End' : `Stop ${i}`}
+                              </td>
+                              <td className="sched-time">{fmtClock(s.plannedArrival)}</td>
+                              <td className="sched-dwell">
+                                {s.timeLimitMin ? `${s.timeLimitMin}m → ${fmtClock(s.plannedDeparture)}` : ''}
+                                {s.deadline ? <span className="chip high" style={{ marginLeft: 4 }}>by {s.deadline}</span> : ''}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                   <label>Route name
                     <input value={routeName} onChange={(e) => setRouteName(e.target.value)} placeholder="Morning delivery run" />
                   </label>

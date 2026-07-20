@@ -95,16 +95,25 @@ app.post('/api/route/plan', authRequired, wrap(async (req, res) => {
 app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
   const {
     name, points, geometry, distanceM, durationS, durationTrafficS,
-    hazard, provider, driverId, scheduledStart,
+    hazard, provider, driverId, scheduledStart, schedule,
   } = req.body;
   if (!name || !points?.length) throw Object.assign(new Error('Route name and points are required'), { status: 400 });
+  // Fold the planned schedule into each stop so points_json is self-contained
+  // (driver and dispatcher read planned times straight off the stops).
+  const enrichedPoints = points.map((p, i) => ({
+    ...p,
+    timeLimitMin: p.timeLimitMin ?? null,
+    deadline: p.deadline ?? null,
+    plannedArrival: schedule?.[i]?.plannedArrival ?? null,
+    plannedDeparture: schedule?.[i]?.plannedDeparture ?? null,
+  }));
   const status = driverId ? 'assigned' : 'draft';
   const result = db.prepare(`
     INSERT INTO routes (org_id, name, driver_id, status, points_json, geometry_json,
       distance_m, duration_s, duration_traffic_s, hazard_score, hazard_count, provider, scheduled_start)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    req.user.org, name, driverId || null, status, JSON.stringify(points),
+    req.user.org, name, driverId || null, status, JSON.stringify(enrichedPoints),
     geometry ? JSON.stringify(geometry) : null, distanceM ?? null, durationS ?? null,
     durationTrafficS ?? null, hazard?.score ?? null, hazard?.count ?? null,
     provider ?? null, scheduledStart ?? null
@@ -150,6 +159,60 @@ app.post('/api/routes/:id/status', authRequired, wrap((req, res) => {
   db.prepare(`UPDATE routes SET status = ?, ${stampCol} = datetime('now') WHERE id = ?`).run(status, id);
   wsHub.notifyOrg(req.user.org, { type: 'route_status', routeId: id, status, driverId: route.driver_id });
   res.json({ route: getRoute(req.user.org, id) });
+}));
+
+// Driver records progress at a stop, or flags running behind. Broadcast to dispatch.
+app.post('/api/routes/:id/stop-event', authRequired, roleRequired('driver'), wrap((req, res) => {
+  const id = Number(req.params.id);
+  const { stopIndex, kind, auto, delayMin, note } = req.body;
+  if (!['arrived', 'departed', 'behind'].includes(kind)) {
+    throw Object.assign(new Error('kind must be arrived, departed, or behind'), { status: 400 });
+  }
+  const route = getRoute(req.user.org, id);
+  if (!route) throw Object.assign(new Error('Route not found'), { status: 404 });
+  if (route.driver_id !== req.user.uid) throw Object.assign(new Error('Not your route'), { status: 403 });
+
+  const idx = Number(stopIndex);
+  // Ignore duplicate arrived/departed for the same stop (auto + manual overlap).
+  if (kind !== 'behind') {
+    const dup = db.prepare(
+      'SELECT id FROM stop_events WHERE route_id = ? AND stop_index = ? AND kind = ? LIMIT 1'
+    ).get(id, idx, kind);
+    if (dup) return res.json({ ok: true, duplicate: true });
+  }
+  db.prepare(
+    'INSERT INTO stop_events (org_id, route_id, driver_id, stop_index, kind, auto, delay_min, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(req.user.org, id, req.user.uid, idx, kind, auto ? 1 : 0, delayMin ?? null, note ?? null);
+
+  const stop = route.points?.[idx];
+  wsHub.notifyOrg(req.user.org, {
+    type: 'stop_event',
+    routeId: id,
+    driverId: req.user.uid,
+    driverName: req.user.name,
+    routeName: route.name,
+    stopIndex: idx,
+    stopName: stop?.name ?? null,
+    kind,
+    auto: Boolean(auto),
+    delayMin: delayMin ?? null,
+    note: note ?? null,
+    ts: Date.now(),
+  });
+  res.json({ ok: true });
+}));
+
+app.get('/api/routes/:id/progress', authRequired, wrap((req, res) => {
+  const id = Number(req.params.id);
+  const route = getRoute(req.user.org, id);
+  if (!route) throw Object.assign(new Error('Route not found'), { status: 404 });
+  if (req.user.role === 'driver' && route.driver_id !== req.user.uid) {
+    throw Object.assign(new Error('Not your route'), { status: 403 });
+  }
+  const events = db.prepare(
+    'SELECT stop_index AS stopIndex, kind, auto, delay_min AS delayMin, note, ts FROM stop_events WHERE route_id = ? ORDER BY id'
+  ).all(id);
+  res.json({ events, stops: route.points });
 }));
 
 app.get('/api/my-route', authRequired, roleRequired('driver'), wrap((req, res) => {

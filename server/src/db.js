@@ -75,4 +75,20 @@ db.exec(`
     crash_date TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_crashes_geo ON crashes(lat, lng);
+
+  -- Per-stop progress and schedule alerts for a route in progress.
+  -- kind: 'arrived' | 'departed' | 'behind'
+  CREATE TABLE IF NOT EXISTS stop_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    route_id INTEGER NOT NULL,
+    driver_id INTEGER NOT NULL,
+    stop_index INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('arrived','departed','behind')),
+    auto INTEGER NOT NULL DEFAULT 0,
+    delay_min INTEGER,
+    note TEXT,
+    ts TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_stop_events_route ON stop_events(route_id, ts);
 `);

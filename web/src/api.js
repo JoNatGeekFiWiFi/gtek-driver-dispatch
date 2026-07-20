@@ -94,3 +94,18 @@ export const fmtAgo = (ts) => {
   if (sec < 3600) return `${Math.round(sec / 60)}m ago`;
   return `${Math.round(sec / 3600)}h ago`;
 };
+
+// Local wall-clock time (e.g. "3:05 PM") from an ISO timestamp.
+export const fmtClock = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+};
+
+// Signed minutes difference, formatted (e.g. "+8m late", "on time").
+export const fmtDelay = (min) => {
+  const m = Math.round(min);
+  if (m <= 0) return 'on time';
+  return `${m}m behind`;
+};

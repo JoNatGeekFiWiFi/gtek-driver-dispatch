@@ -57,6 +57,7 @@ async function osrmRoute(points) {
     distanceM: r.distance,
     durationS: r.duration,
     durationTrafficS: null, // filled in by the rush-hour model
+    legs: (r.legs || []).map((l) => ({ durationS: l.duration, distanceM: l.distance })),
   };
 }
 
@@ -74,6 +75,7 @@ async function mapboxRoute(points, token) {
     distanceM: r.distance,
     durationS: r.duration_typical ?? r.duration,
     durationTrafficS: r.duration,
+    legs: (r.legs || []).map((l) => ({ durationS: l.duration_typical ?? l.duration, distanceM: l.distance })),
   };
 }
 
@@ -93,6 +95,10 @@ async function tomtomRoute(points, key) {
     distanceM: r.summary.lengthInMeters,
     durationS: r.summary.noTrafficTravelTimeInSeconds ?? r.summary.travelTimeInSeconds,
     durationTrafficS: r.summary.travelTimeInSeconds,
+    legs: (r.legs || []).map((l) => ({
+      durationS: l.summary.noTrafficTravelTimeInSeconds ?? l.summary.travelTimeInSeconds,
+      distanceM: l.summary.lengthInMeters,
+    })),
   };
 }
 
@@ -110,9 +116,13 @@ export function haversineM(a, b) {
 // Last-resort estimate when no routing service is reachable: straight legs,
 // road-factor-adjusted distance, 30 mph average.
 function offlineEstimate(points) {
+  const legs = [];
   let dist = 0;
-  for (let i = 1; i < points.length; i++) dist += haversineM(points[i - 1], points[i]);
-  dist *= 1.25;
+  for (let i = 1; i < points.length; i++) {
+    const legM = haversineM(points[i - 1], points[i]) * 1.25;
+    legs.push({ durationS: legM / 13.4, distanceM: legM });
+    dist += legM;
+  }
   return {
     provider: 'offline-estimate',
     liveTraffic: false,
@@ -120,6 +130,7 @@ function offlineEstimate(points) {
     distanceM: dist,
     durationS: dist / 13.4,
     durationTrafficS: null,
+    legs,
   };
 }
 
@@ -153,7 +164,46 @@ export async function planRoute(points, departAt) {
     route.durationTrafficS = Math.round(route.durationS * rushHourMultiplier(departAt));
   }
   route.departureProfile = departureProfile(route.durationS, departAt);
+  route.schedule = computeSchedule(points, route.legs, departAt, route);
   return route;
+}
+
+// Planned arrival/departure per stop from the start time, per-leg drive times,
+// and each stop's dwell allowance. Legs get the live-traffic ratio (paid
+// providers) or a time-of-day rush-hour multiplier applied at the moment the
+// driver would actually be on that leg (free path) — so a long multi-stop run
+// accounts for hitting rush hour partway through.
+export function computeSchedule(points, legs, departAt, route = {}) {
+  if (!Array.isArray(points) || !points.length) return [];
+  const start = departAt ? new Date(departAt) : new Date();
+  const trafficRatio =
+    route.liveTraffic && route.durationS ? route.durationTrafficS / route.durationS : null;
+
+  const schedule = [];
+  let cursor = start.getTime();
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (i > 0) {
+      const rawLeg = legs?.[i - 1]?.durationS ?? 0;
+      const factor = trafficRatio != null ? trafficRatio : rushHourMultiplier(new Date(cursor));
+      cursor += rawLeg * factor * 1000;
+    }
+    const plannedArrival = new Date(cursor);
+    const dwellMin = Number(p.timeLimitMin) || 0;
+    cursor += dwellMin * 60 * 1000;
+    const plannedDeparture = new Date(cursor);
+    schedule.push({
+      index: i,
+      name: p.name,
+      lat: p.lat,
+      lng: p.lng,
+      timeLimitMin: dwellMin || null,
+      deadline: p.deadline || null, // optional hard "must arrive by" ISO/clock
+      plannedArrival: plannedArrival.toISOString(),
+      plannedDeparture: dwellMin ? plannedDeparture.toISOString() : plannedArrival.toISOString(),
+    });
+  }
+  return schedule;
 }
 
 export function activeProviders() {

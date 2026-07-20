@@ -2,13 +2,17 @@
 
 A dispatch platform for building driver routes and tracking drivers live.
 
-- **Dispatcher dashboard** (browser): build routes with start/end/stops, see ETAs
-  with rush-hour or live-traffic adjustment, crash-hazard scores from public
-  NHTSA data, assign routes to drivers, and watch drivers move on the map in
-  real time with off-route alerts.
+- **Dispatcher dashboard** (browser): build routes with start/end/stops, set a
+  **dwell time limit and optional hard deadline per stop**, see ETAs with
+  rush-hour or live-traffic adjustment and a **planned per-stop schedule**,
+  crash-hazard scores from public NHTSA data, assign routes to drivers, and
+  watch drivers move on the map in real time with off-route and
+  **running-behind alerts**.
 - **Driver app** (phone/tablet browser, installable as a PWA): shows the
-  assigned route, start/complete buttons, and streams live GPS to dispatch
-  while the app is open.
+  assigned route as a **stop-by-stop tracker** with planned times, **auto-marks
+  arrival** within ~120 m of each stop (with manual backup), a **"Running
+  behind" button**, a map that **follows the driver**, and streams live GPS to
+  dispatch. Auto-alerts dispatch when the driver falls behind the schedule.
 - **Multi-tenant**: each company registers its own workspace; dispatchers only
   see their own drivers and routes.
 
