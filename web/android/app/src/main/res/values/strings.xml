@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Dispatch Driver</string>
+    <string name="title_activity_main">Dispatch Driver</string>
+    <string name="package_name">com.dispatchroutebuilder.driver</string>
+    <string name="custom_url_scheme">com.dispatchroutebuilder.driver</string>
+</resources>

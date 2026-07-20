@@ -1,0 +1,12 @@
+{
+  "name": "Dispatch Route Builder",
+  "short_name": "Dispatch",
+  "description": "Driver routes, live tracking, and dispatch",
+  "start_url": "/driver",
+  "display": "standalone",
+  "background_color": "#101418",
+  "theme_color": "#101418",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

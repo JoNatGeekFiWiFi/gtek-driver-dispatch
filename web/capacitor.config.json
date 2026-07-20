@@ -1,0 +1,14 @@
+{
+  "appId": "com.dispatchroutebuilder.driver",
+  "appName": "Dispatch Driver",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http"
+  },
+  "android": {
+    "allowMixedContent": false
+  },
+  "ios": {
+    "contentInset": "always"
+  }
+}

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+server/data/*.db
+server/data/*.db-*
+.DS_Store
+
+# Capacitor native build outputs (the projects themselves are committed)
+web/android/.gradle/
+web/android/app/build/
+web/android/build/
+web/android/local.properties
+web/android/app/src/main/assets/public/
+web/ios/App/Pods/
+web/ios/App/App/public/
+web/ios/App/App/capacitor.config.json
