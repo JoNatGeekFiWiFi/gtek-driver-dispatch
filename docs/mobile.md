@@ -56,10 +56,22 @@ Repeat 1–2 whenever the web app changes; the native shells rarely need touchin
 
 ## Local testing against the dev server (verified working)
 
-The Android build was tested end-to-end on an emulator (Pixel 7 profile,
-Android 35 google_apis image): login → assigned route on the map → native
-background tracking service → GPS position delivered to the dispatch server
-with off-route detection. Notes from that setup:
+Both platforms were tested end-to-end against the local dev server, full chain:
+login → assigned route on the map → native background tracking → GPS delivered
+to the dispatch server with on/off-route detection → live marker on the
+dispatcher dashboard.
+
+- **Android**: Pixel 7 profile, Android 35 google_apis emulator image.
+- **iOS**: iPhone 17 simulator, iOS 26.5. Built via SPM with
+  `xcodebuild ... -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO` (simulator
+  builds need no signing team). The custom Info.plist permission string shows
+  correctly in the iOS location prompt. GPS fed via
+  `xcrun simctl location <udid> set <lat>,<lng>`. Note: the driver map
+  recenters only on the FIRST fix, and the simulator's default location may
+  arrive before yours — on a real device the first fix is the true location,
+  so this is simulator-only.
+
+Notes from the Android setup:
 
 - `capacitor.config.json` currently sets `server.androidScheme: "http"` so the
   app (served from `http://localhost`) may call a plain-HTTP dev API without a

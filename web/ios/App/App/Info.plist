@@ -55,5 +55,12 @@
 	<array>
 		<string>location</string>
 	</array>
+	<!-- Permit cleartext connections to a local dev server only (localhost/.local).
+	     Does NOT weaken security for production HTTPS APIs on the public internet. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

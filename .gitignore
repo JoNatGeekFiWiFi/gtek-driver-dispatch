@@ -14,3 +14,4 @@ web/android/app/src/main/assets/public/
 web/ios/App/Pods/
 web/ios/App/App/public/
 web/ios/App/App/capacitor.config.json
+web/ios/App/build/
