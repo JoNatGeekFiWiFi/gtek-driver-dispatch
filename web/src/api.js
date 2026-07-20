@@ -95,6 +95,27 @@ export const fmtAgo = (ts) => {
   return `${Math.round(sec / 3600)}h ago`;
 };
 
+export const WALK_SPEED_MPS = 1.34; // ~3 mph
+
+export function haversineM(aLat, aLng, bLat, bLng) {
+  const R = 6371000, toRad = Math.PI / 180;
+  const dLat = (bLat - aLat) * toRad, dLng = (bLng - aLng) * toRad;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(aLat * toRad) * Math.cos(bLat * toRad) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(s));
+}
+
+// One-way length (m) of a walk path GeoJSON LineString.
+export function walkOneWayM(geometry) {
+  const c = geometry?.coordinates;
+  if (!c || c.length < 2) return 0;
+  let m = 0;
+  for (let i = 1; i < c.length; i++) m += haversineM(c[i - 1][1], c[i - 1][0], c[i][1], c[i][0]);
+  return m;
+}
+
+// Round-trip walk time (minutes) — driver walks out and back to the vehicle.
+export const walkRoundTripMin = (oneWayM) => Math.round((oneWayM * 2) / WALK_SPEED_MPS / 60);
+
 // Local wall-clock time (e.g. "3:05 PM") from an ISO timestamp.
 export const fmtClock = (iso) => {
   if (!iso) return '—';

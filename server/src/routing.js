@@ -102,6 +102,28 @@ async function tomtomRoute(points, key) {
   };
 }
 
+// Average walking pace, ~3 mph. Used to turn a walk path length into time.
+export const WALK_SPEED_MPS = 1.34;
+
+// One-way distance and round-trip time for a stop's walking sub-path.
+// The driver parks at the stop, walks the path to the destination, and walks
+// back to the vehicle — so time counts the length twice.
+export function walkMetrics(walk) {
+  if (!walk) return { oneWayM: 0, roundTripS: 0 };
+  let oneWayM = Number(walk.oneWayM) || 0;
+  const coords = walk.geometry?.coordinates;
+  if (!oneWayM && coords && coords.length >= 2) {
+    for (let i = 1; i < coords.length; i++) {
+      oneWayM += haversineM(
+        { lng: coords[i - 1][0], lat: coords[i - 1][1] },
+        { lng: coords[i][0], lat: coords[i][1] }
+      );
+    }
+  }
+  const onSiteS = (Number(walk.onSiteMin) || 0) * 60;
+  return { oneWayM, roundTripS: (oneWayM * 2) / WALK_SPEED_MPS + onSiteS };
+}
+
 const EARTH_M = 111320;
 export function haversineM(a, b) {
   const dLat = (b.lat - a.lat) * (Math.PI / 180);
@@ -190,7 +212,9 @@ export function computeSchedule(points, legs, departAt, route = {}) {
     }
     const plannedArrival = new Date(cursor);
     const dwellMin = Number(p.timeLimitMin) || 0;
-    cursor += dwellMin * 60 * 1000;
+    const walk = walkMetrics(p.walk);
+    const dwellS = dwellMin * 60 + walk.roundTripS;
+    cursor += dwellS * 1000;
     const plannedDeparture = new Date(cursor);
     schedule.push({
       index: i,
@@ -199,8 +223,10 @@ export function computeSchedule(points, legs, departAt, route = {}) {
       lng: p.lng,
       timeLimitMin: dwellMin || null,
       deadline: p.deadline || null, // optional hard "must arrive by" ISO/clock
+      walkMin: walk.roundTripS ? Math.round(walk.roundTripS / 60) : null,
+      walkMeters: walk.oneWayM ? Math.round(walk.oneWayM) : null,
       plannedArrival: plannedArrival.toISOString(),
-      plannedDeparture: dwellMin ? plannedDeparture.toISOString() : plannedArrival.toISOString(),
+      plannedDeparture: dwellS ? plannedDeparture.toISOString() : plannedArrival.toISOString(),
     });
   }
   return schedule;
@@ -210,5 +236,38 @@ export function activeProviders() {
   return {
     routing: process.env.MAPBOX_TOKEN ? 'mapbox' : process.env.TOMTOM_KEY ? 'tomtom' : 'osrm (free)',
     liveTraffic: Boolean(process.env.MAPBOX_TOKEN || process.env.TOMTOM_KEY),
+    walkRouter: process.env.ORS_TOKEN ? 'openrouteservice' : process.env.MAPBOX_TOKEN ? 'mapbox' : null,
   };
+}
+
+// Foot-routing between two points for the "routed" walk mode. Uses
+// OpenRouteService (ORS_TOKEN) or Mapbox walking (MAPBOX_TOKEN). Without a key
+// the dispatcher uses the free traced/point modes instead.
+export async function walkRoute(from, to) {
+  if (process.env.ORS_TOKEN) {
+    const res = await fetch('https://api.openrouteservice.org/v2/directions/foot-walking/geojson', {
+      method: 'POST',
+      headers: { Authorization: process.env.ORS_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coordinates: [[from.lng, from.lat], [to.lng, to.lat]] }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT),
+    });
+    if (!res.ok) throw new Error(`OpenRouteService: ${res.status}`);
+    const data = await res.json();
+    const f = data.features?.[0];
+    if (!f) throw new Error('No walking route found');
+    return { geometry: f.geometry, oneWayM: f.properties?.summary?.distance ?? null, provider: 'openrouteservice' };
+  }
+  if (process.env.MAPBOX_TOKEN) {
+    const url =
+      `https://api.mapbox.com/directions/v5/mapbox/walking/${from.lng},${from.lat};${to.lng},${to.lat}` +
+      `?geometries=geojson&overview=full&access_token=${process.env.MAPBOX_TOKEN}`;
+    const data = await fetchJson(url);
+    const r = data.routes?.[0];
+    if (!r) throw new Error('No walking route found');
+    return { geometry: r.geometry, oneWayM: r.distance, provider: 'mapbox' };
+  }
+  throw Object.assign(
+    new Error('No walking router configured — trace the path or drop a point instead, or set ORS_TOKEN / MAPBOX_TOKEN'),
+    { status: 400 }
+  );
 }

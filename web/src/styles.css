@@ -231,6 +231,12 @@ input:focus, select:focus { outline: 2px solid rgba(47, 125, 246, 0.5); border-c
 .with-unit input { text-align: right; }
 .with-unit span { color: var(--muted); font-size: 12px; }
 
+/* ---- Walking sub-path controls ---- */
+.walk-controls { display: flex; align-items: center; gap: 6px; padding-left: 18px; flex-wrap: wrap; }
+.walk-label { font-size: 11px; color: var(--green); font-weight: 600; }
+.walk-modes { display: flex; gap: 4px; }
+.walk-info { font-size: 11.5px; color: var(--green); }
+
 /* ---- Planned schedule table ---- */
 .sched-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12px; }
 .sched-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
@@ -260,6 +266,10 @@ input:focus, select:focus { outline: 2px solid rgba(47, 125, 246, 0.5); border-c
 .stop-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stop-meta { color: var(--muted); font-size: 11.5px; }
 .stop-item .btn { flex: none; }
+
+.walk-badge { margin-left: 6px; font-size: 11px; color: var(--green); font-weight: 600; }
+.walk-phase { display: inline-block; margin-top: 4px; font-size: 12.5px; font-weight: 600; color: var(--green); }
+.walk-phase.back { color: var(--amber); }
 
 .behind-picker { margin: 8px 0; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

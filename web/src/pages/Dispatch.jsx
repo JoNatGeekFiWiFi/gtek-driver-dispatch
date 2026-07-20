@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, openWs, clearSession, getUser, fmtMiles, fmtDuration, fmtAgo, fmtClock } from '../api.js';
-import { createMap, setLineLayer, setCrashLayer, removeCrashLayer, makeMarker } from '../map.js';
+import { api, openWs, clearSession, getUser, fmtMiles, fmtDuration, fmtAgo, fmtClock, walkOneWayM, walkRoundTripMin } from '../api.js';
+import { createMap, setLineLayer, setCrashLayer, removeCrashLayer, makeMarker, setWalkPaths } from '../map.js';
 
 const POINT_COLORS = { first: '#2ecc71', last: '#e74c3c', mid: '#2f7df6' };
 
@@ -22,6 +22,7 @@ export default function Dispatch() {
   const [departAt, setDepartAt] = useState(() => toLocalInput(new Date()));
   const [plan, setPlan] = useState(null);
   const [planning, setPlanning] = useState(false);
+  const [walkEdit, setWalkEdit] = useState(null); // { stopIndex, mode } while tracing a walk
   const [routeName, setRouteName] = useState('');
   const [assignTo, setAssignTo] = useState('');
   const [msg, setMsg] = useState(null); // {kind:'error'|'success', text}
@@ -47,10 +48,15 @@ export default function Dispatch() {
     return () => map.remove();
   }, []);
 
-  // map click appends a route point (start, then stops, then end)
+  // map click: while editing a stop's walk path it adds walk waypoints,
+  // otherwise it appends a route point (start, then stops, then end).
   clickHandler.current = (e) => {
     if (tab !== 'build') return;
     const { lat, lng } = e.lngLat;
+    if (walkEditRef.current) {
+      handleWalkClick(lat, lng);
+      return;
+    }
     addPoint({ lat, lng, name: `${lat.toFixed(4)}, ${lng.toFixed(4)}` });
   };
 
@@ -67,6 +73,57 @@ export default function Dispatch() {
     setPlan(null);
   }
 
+  // ---- walking sub-path editing ----
+  const walkEditRef = useRef(null);
+  useEffect(() => { walkEditRef.current = walkEdit; }, [walkEdit]);
+
+  function setWalk(i, walk) {
+    setPoints((pts) => pts.map((p, j) => (j === i ? { ...p, walk } : p)));
+    setPlan(null);
+  }
+
+  function startWalkEdit(i, mode) {
+    if (mode === 'none') { setWalk(i, null); setWalkEdit(null); return; }
+    setWalk(i, { mode, geometry: null, oneWayM: 0 }); // reset; awaits map clicks
+    setWalkEdit({ stopIndex: i, mode });
+    setMsg({ kind: 'success', text: mode === 'traced'
+      ? 'Click the map to trace the walk from the vehicle; click “Finish walk” when done.'
+      : mode === 'point' ? 'Click the walk destination on the map.'
+      : 'Click the walk destination — it will be routed on foot.' });
+  }
+
+  async function handleWalkClick(lat, lng) {
+    const edit = walkEditRef.current;
+    if (!edit) return;
+    const i = edit.stopIndex;
+    const stop = points[i];
+    if (edit.mode === 'traced') {
+      // Walk starts at the vehicle (the stop) and follows each clicked point.
+      setPoints((pts) => pts.map((p, j) => {
+        if (j !== i) return p;
+        const coords = p.walk?.geometry?.coordinates?.length
+          ? [...p.walk.geometry.coordinates, [lng, lat]]
+          : [[p.lng, p.lat], [lng, lat]];
+        const geometry = { type: 'LineString', coordinates: coords };
+        return { ...p, walk: { mode: 'traced', geometry, oneWayM: walkOneWayM(geometry) } };
+      }));
+      setPlan(null);
+    } else if (edit.mode === 'point') {
+      const geometry = { type: 'LineString', coordinates: [[stop.lng, stop.lat], [lng, lat]] };
+      setWalk(i, { mode: 'point', geometry, oneWayM: walkOneWayM(geometry) });
+      setWalkEdit(null);
+    } else if (edit.mode === 'routed') {
+      try {
+        const r = await api('/api/walk/route', { method: 'POST', body: { from: { lat: stop.lat, lng: stop.lng }, to: { lat, lng } } });
+        setWalk(i, { mode: 'routed', geometry: r.geometry, oneWayM: r.oneWayM ?? walkOneWayM(r.geometry) });
+        setMsg({ kind: 'success', text: `Walk routed on foot (${r.provider})` });
+      } catch (err) {
+        setMsg({ kind: 'error', text: err.message });
+      }
+      setWalkEdit(null);
+    }
+  }
+
   // keep point markers in sync
   useEffect(() => {
     pointMarkers.current.forEach((m) => m.remove());
@@ -75,6 +132,7 @@ export default function Dispatch() {
         i === 0 ? POINT_COLORS.first : i === points.length - 1 && points.length > 1 ? POINT_COLORS.last : POINT_COLORS.mid;
       return makeMarker(mapRef.current, [p.lng, p.lat], { color, label: p.name });
     });
+    if (mapRef.current) setWalkPaths(mapRef.current, points);
   }, [points]);
 
   // draw planned route
@@ -136,6 +194,8 @@ export default function Dispatch() {
         refreshRoutes();
       } else if (m.type === 'stop_event') {
         setAlerts((prev) => [{ ...m, id: `${m.driverId}-${m.ts}` }, ...prev].slice(0, 30));
+      } else if (m.type === 'walk_status') {
+        setAlerts((prev) => [{ ...m, kind: 'walk', id: `${m.driverId}-${m.ts}` }, ...prev].slice(0, 30));
       }
     });
     return () => ws?.close();
@@ -307,13 +367,17 @@ export default function Dispatch() {
               <div className="alert-feed">
                 {alerts.slice(0, 8).map((a) => (
                   <div key={a.id} className={`alert-line ${a.kind}`}>
-                    <span className="alert-icon">{a.kind === 'behind' ? '⚠' : a.kind === 'arrived' ? '●' : '→'}</span>
+                    <span className="alert-icon">{a.kind === 'behind' ? '⚠' : a.kind === 'arrived' ? '●' : a.kind === 'walk' ? '🚶' : '→'}</span>
                     <span className="alert-text">
                       <b>{a.driverName}</b>{' '}
                       {a.kind === 'behind'
                         ? `running behind${a.delayMin ? ` ~${a.delayMin}m` : ''}${a.stopName ? ` (before ${a.stopName})` : ''}`
                         : a.kind === 'arrived'
                         ? `arrived at ${a.stopName || `stop ${a.stopIndex}`}${a.auto ? '' : ' (manual)'}`
+                        : a.kind === 'walk'
+                        ? (a.phase === 'walking' ? `walking to ${a.stopName || `stop ${a.stopIndex}`}`
+                           : a.phase === 'returning' ? `walking back to the vehicle at ${a.stopName || `stop ${a.stopIndex}`}`
+                           : `finished the walk at ${a.stopName || `stop ${a.stopIndex}`}`)
                         : `departed ${a.stopName || `stop ${a.stopIndex}`}`}
                       {a.note ? ` — “${a.note}”` : ''}
                     </span>
@@ -375,6 +439,35 @@ export default function Dispatch() {
                               value={p.deadline ?? ''}
                               onChange={(e) => updatePoint(i, { deadline: e.target.value || null })} />
                           </label>
+                        </div>
+                      )}
+                      {!isStart && !isEnd && (
+                        <div className="walk-controls">
+                          <span className="walk-label">🚶 Walk</span>
+                          {walkEdit?.stopIndex === i ? (
+                            <>
+                              <span className="muted" style={{ fontSize: 11 }}>
+                                {walkEdit.mode === 'traced' ? 'tracing…' : 'click destination…'}
+                              </span>
+                              {walkEdit.mode === 'traced' && (
+                                <button className="btn small" onClick={() => setWalkEdit(null)}>Finish walk</button>
+                              )}
+                              <button className="btn link small" onClick={() => { setWalk(i, null); setWalkEdit(null); }}>cancel</button>
+                            </>
+                          ) : p.walk?.geometry ? (
+                            <>
+                              <span className="walk-info">
+                                {Math.round(p.walk.oneWayM || walkOneWayM(p.walk.geometry))} m · ~{walkRoundTripMin(p.walk.oneWayM || walkOneWayM(p.walk.geometry))} min round trip
+                              </span>
+                              <button className="btn link small" onClick={() => setWalk(i, null)}>remove</button>
+                            </>
+                          ) : (
+                            <span className="walk-modes">
+                              <button className="btn small" onClick={() => startWalkEdit(i, 'traced')}>Trace</button>
+                              <button className="btn small" onClick={() => startWalkEdit(i, 'point')}>Point</button>
+                              <button className="btn small" onClick={() => startWalkEdit(i, 'routed')}>Routed</button>
+                            </span>
+                          )}
                         </div>
                       )}
                     </li>
@@ -442,7 +535,9 @@ export default function Dispatch() {
                               </td>
                               <td className="sched-time">{fmtClock(s.plannedArrival)}</td>
                               <td className="sched-dwell">
-                                {s.timeLimitMin ? `${s.timeLimitMin}m → ${fmtClock(s.plannedDeparture)}` : ''}
+                                {s.walkMin ? <span className="chip" style={{ background: '#1d6b40', marginRight: 4 }}>🚶 {s.walkMin}m</span> : ''}
+                                {s.timeLimitMin ? `${s.timeLimitMin}m → ` : ''}
+                                {(s.timeLimitMin || s.walkMin) ? fmtClock(s.plannedDeparture) : ''}
                                 {s.deadline ? <span className="chip high" style={{ marginLeft: 4 }}>by {s.deadline}</span> : ''}
                               </td>
                             </tr>

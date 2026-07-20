@@ -7,7 +7,7 @@ import { db } from './db.js';
 import {
   registerOrg, createDriver, login, signToken, authRequired, roleRequired,
 } from './auth.js';
-import { planRoute, activeProviders } from './routing.js';
+import { planRoute, activeProviders, walkRoute } from './routing.js';
 import { geocode } from './geocode.js';
 import { crashesInBbox, crashStats, hazardForGeometry, STATE_FIPS } from './crashes.js';
 import { sourcesForState, runImport } from './importers.js';
@@ -89,6 +89,13 @@ app.post('/api/route/plan', authRequired, wrap(async (req, res) => {
   const route = await planRoute(points, departAt);
   const hazard = hazardForGeometry(route.geometry);
   res.json({ ...route, hazard });
+}));
+
+// Foot route for a stop's "routed" walk mode (needs ORS_TOKEN/MAPBOX_TOKEN).
+app.post('/api/walk/route', authRequired, roleRequired('dispatcher'), wrap(async (req, res) => {
+  const { from, to } = req.body;
+  if (!from || !to) throw Object.assign(new Error('from and to points are required'), { status: 400 });
+  res.json(await walkRoute(from, to));
 }));
 
 // ---- Routes ----
@@ -197,6 +204,31 @@ app.post('/api/routes/:id/stop-event', authRequired, roleRequired('driver'), wra
     auto: Boolean(auto),
     delayMin: delayMin ?? null,
     note: note ?? null,
+    ts: Date.now(),
+  });
+  res.json({ ok: true });
+}));
+
+// Live-only walk phase for a stop (walking, returning, done) — broadcast to
+// dispatch without persisting, so the board shows a driver mid-walk.
+app.post('/api/routes/:id/walk-status', authRequired, roleRequired('driver'), wrap((req, res) => {
+  const id = Number(req.params.id);
+  const { stopIndex, phase } = req.body;
+  if (!['walking', 'returning', 'done'].includes(phase)) {
+    throw Object.assign(new Error('phase must be walking, returning, or done'), { status: 400 });
+  }
+  const route = getRoute(req.user.org, id);
+  if (!route || route.driver_id !== req.user.uid) {
+    throw Object.assign(new Error('Not your route'), { status: 403 });
+  }
+  wsHub.notifyOrg(req.user.org, {
+    type: 'walk_status',
+    routeId: id,
+    driverId: req.user.uid,
+    driverName: req.user.name,
+    stopIndex: Number(stopIndex),
+    stopName: route.points?.[Number(stopIndex)]?.name ?? null,
+    phase,
     ts: Date.now(),
   });
   res.json({ ok: true });

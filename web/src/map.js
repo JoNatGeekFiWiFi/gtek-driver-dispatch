@@ -128,6 +128,38 @@ export function removeCrashLayer(map, id) {
   if (map.getSource(id)) map.removeSource(id);
 }
 
+// Draw all stops' walking sub-paths as dashed lines with a foot-destination
+// dot at the far end. Reuses one source/layer set per map.
+export function setWalkPaths(map, stops) {
+  const lines = { type: 'FeatureCollection', features: [] };
+  const ends = { type: 'FeatureCollection', features: [] };
+  (stops || []).forEach((s) => {
+    const c = s.walk?.geometry?.coordinates;
+    if (!c || c.length < 2) return;
+    lines.features.push({ type: 'Feature', geometry: s.walk.geometry, properties: {} });
+    ends.features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: c[c.length - 1] }, properties: {} });
+  });
+  const apply = () => {
+    if (map.getSource('walk-lines')) {
+      map.getSource('walk-lines').setData(lines);
+      map.getSource('walk-ends').setData(ends);
+      return;
+    }
+    map.addSource('walk-lines', { type: 'geojson', data: lines });
+    map.addLayer({
+      id: 'walk-lines', type: 'line', source: 'walk-lines',
+      layout: { 'line-cap': 'round' },
+      paint: { 'line-color': '#2ecc71', 'line-width': 3, 'line-dasharray': [1, 1.5] },
+    });
+    map.addSource('walk-ends', { type: 'geojson', data: ends });
+    map.addLayer({
+      id: 'walk-ends', type: 'circle', source: 'walk-ends',
+      paint: { 'circle-radius': 5, 'circle-color': '#2ecc71', 'circle-stroke-width': 2, 'circle-stroke-color': '#fff' },
+    });
+  };
+  map.isStyleLoaded() ? apply() : map.once('styledata', apply);
+}
+
 // Numbered stop markers for a route. `arrived` is a map of visited stop
 // indices; `targetIdx` is the stop the driver is currently heading to.
 // Reuses a per-map marker array so repeated calls don't leak markers.

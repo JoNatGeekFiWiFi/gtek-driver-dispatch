@@ -13,6 +13,12 @@ A dispatch platform for building driver routes and tracking drivers live.
   arrival** within ~120 m of each stop (with manual backup), a **"Running
   behind" button**, a map that **follows the driver**, and streams live GPS to
   dispatch. Auto-alerts dispatch when the driver falls behind the schedule.
+- **Walking sub-paths**: a stop can carry an on-foot leg (park → walk to the
+  site → walk back to the vehicle). The dispatcher defines it by tracing it on
+  the map, dropping a single destination point, or foot-routing it (with a
+  walking-router key). Walk time folds into the stop's schedule; the driver app
+  guides the walk-out/walk-back with auto-detection and reports each phase to
+  dispatch live.
 - **Multi-tenant**: each company registers its own workspace; dispatchers only
   see their own drivers and routes.
 
