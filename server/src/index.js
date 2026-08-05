@@ -19,16 +19,71 @@ const PORT = process.env.API_PORT || 4000;
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-// The native driver app (Capacitor) calls this API from its own origin, so
-// cross-origin requests must be allowed. Browser/PWA traffic is same-origin
-// and unaffected.
+// Behind a load balancer this makes req.ip the real client address (needed by
+// the auth rate limiter). Set TRUST_PROXY=1 when deploying behind one.
+if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
+
+// The native driver app calls this API cross-origin, so those origins must be
+// allowed — but reflecting *any* origin, as this used to, is broader than
+// needed. Capacitor's own origins stay allowed; add your web app's origin(s)
+// with CORS_ORIGINS=https://dispatch.example.com,https://admin.example.com
+const NATIVE_ORIGINS = ['capacitor://localhost', 'http://localhost', 'https://localhost'];
+const CONFIGURED_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const DEV_ORIGIN = /^http:\/\/localhost:\d+$/;
+
+function originAllowed(origin) {
+  if (NATIVE_ORIGINS.includes(origin) || CONFIGURED_ORIGINS.includes(origin)) return true;
+  // Vite's dev server and friends — only outside production.
+  return process.env.NODE_ENV !== 'production' && DEV_ORIGIN.test(origin);
+}
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  const { origin } = req.headers;
+  // No Origin header = same-origin or a non-browser client (curl, the native
+  // HTTP stack); nothing to authorise.
+  if (origin && originAllowed(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(origin && !originAllowed(origin) ? 403 : 204);
   next();
 });
+
+// ---- Sign-in throttling ----
+// Credentials are the one endpoint worth guessing at, so cap failures per
+// client. In-memory is fine for a single node; move to Redis if you scale out.
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 10;
+const authFailures = new Map(); // ip -> { count, first }
+
+function authLimiter(req, res, next) {
+  const rec = authFailures.get(req.ip);
+  if (!rec) return next();
+  if (Date.now() - rec.first >= AUTH_WINDOW_MS) {
+    authFailures.delete(req.ip);
+    return next();
+  }
+  if (rec.count >= AUTH_MAX_FAILURES) {
+    const mins = Math.ceil((AUTH_WINDOW_MS - (Date.now() - rec.first)) / 60000);
+    return res.status(429).json({ error: `Too many failed sign-in attempts. Try again in ${mins} minute(s).` });
+  }
+  next();
+}
+
+function noteAuthFailure(ip) {
+  const rec = authFailures.get(ip);
+  if (!rec || Date.now() - rec.first >= AUTH_WINDOW_MS) authFailures.set(ip, { count: 1, first: Date.now() });
+  else rec.count++;
+}
+
+// Keep the map from growing without bound on a long-lived process.
+setInterval(() => {
+  const cutoff = Date.now() - AUTH_WINDOW_MS;
+  for (const [ip, rec] of authFailures) if (rec.first < cutoff) authFailures.delete(ip);
+}, AUTH_WINDOW_MS).unref();
 
 const server = http.createServer(app);
 const wsHub = setupWs(server);
@@ -52,13 +107,20 @@ function sendError(res, err) {
 }
 
 // ---- Auth ----
-app.post('/api/auth/register', wrap((req, res) => {
+app.post('/api/auth/register', authLimiter, wrap((req, res) => {
   const user = registerOrg(req.body);
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
 
-app.post('/api/auth/login', wrap((req, res) => {
-  const user = login(req.body);
+app.post('/api/auth/login', authLimiter, wrap((req, res) => {
+  let user;
+  try {
+    user = login(req.body);
+  } catch (err) {
+    noteAuthFailure(req.ip);
+    throw err;
+  }
+  authFailures.delete(req.ip); // a success clears the streak
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
 
@@ -148,7 +210,10 @@ app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res
     provider ?? null, scheduledStart ?? null
   );
   const route = getRoute(req.user.org, result.lastInsertRowid);
-  if (driverId) wsHub.notifyOrg(req.user.org, { type: 'route_assigned', routeId: route.id, driverId });
+  if (driverId) {
+    wsHub.invalidateDriver(driverId);
+    wsHub.notifyOrg(req.user.org, { type: 'route_assigned', routeId: route.id, driverId });
+  }
   res.json({ route });
 }));
 
@@ -170,6 +235,8 @@ app.post('/api/routes/:id/assign', authRequired, roleRequired('dispatcher'), wra
   db.prepare("UPDATE routes SET driver_id = ?, status = 'assigned' WHERE id = ? AND org_id = ?")
     .run(driverId, id, req.user.org);
   wsHub.invalidateRoute(id);
+  wsHub.invalidateDriver(driverId);
+  wsHub.invalidateDriver(route.driver_id); // the driver it was taken away from
   wsHub.notifyOrg(req.user.org, { type: 'route_assigned', routeId: id, driverId });
   res.json({ route: getRoute(req.user.org, id) });
 }));
@@ -187,6 +254,7 @@ app.post('/api/routes/:id/status', authRequired, wrap((req, res) => {
   }
   const stampCol = status === 'in_progress' ? 'started_at' : 'completed_at';
   db.prepare(`UPDATE routes SET status = ?, ${stampCol} = datetime('now') WHERE id = ?`).run(status, id);
+  wsHub.invalidateDriver(route.driver_id); // completed routes drop out of "active"
   wsHub.notifyOrg(req.user.org, { type: 'route_status', routeId: id, status, driverId: route.driver_id });
   res.json({ route: getRoute(req.user.org, id) });
 }));
@@ -301,7 +369,8 @@ function parseRouteRow(row) {
 // ---- Crash data ----
 app.get('/api/crashes', authRequired, wrap((req, res) => {
   const { minLat, minLng, maxLat, maxLng } = req.query;
-  res.json({ crashes: crashesInBbox({ minLat, minLng, maxLat, maxLng }) });
+  // Overlay is a visual density layer — sampling keeps wide zooms fast.
+  res.json({ crashes: crashesInBbox({ minLat, minLng, maxLat, maxLng, sample: true }) });
 }));
 
 app.get('/api/crashes/stats', authRequired, wrap((req, res) => {

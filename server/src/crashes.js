@@ -75,14 +75,65 @@ export async function ingestNhtsa({ state, fromYear, toYear }) {
   return { inserted, totalRows: rows.length };
 }
 
-export function crashesInBbox({ minLat, minLng, maxLat, maxLng, limit = 3000 }) {
-  // Random sample when the view holds more points than the cap, so wide zooms
-  // show a representative density instead of whichever source imported first.
-  return db
-    .prepare(
-      'SELECT lat, lng, fatals, severity, year, source FROM crashes WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? ORDER BY RANDOM() LIMIT ?'
-    )
-    .all(Number(minLat), Number(maxLat), Number(minLng), Number(maxLng), Number(limit));
+// ~0.005 degrees ≈ 500 m. CELL_SCALE is 1/CELL_DEG.
+const CELL_SCALE = 200;
+
+const bboxAllStmt = db.prepare(
+  'SELECT lat, lng, fatals, severity, year, source FROM crashes WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT ?'
+);
+const cellsInBoxStmt = db.prepare(
+  'SELECT lat, lng, n, fatals FROM crash_cells WHERE gy BETWEEN ? AND ? AND gx BETWEEN ? AND ?'
+);
+
+// Rebuild the density grid. Called after every crash import; cheap relative to
+// the import itself, and it's the only thing that has to stay in sync.
+export function rebuildCrashCells() {
+  db.exec('BEGIN');
+  try {
+    db.exec('DELETE FROM crash_cells');
+    db.exec(`
+      INSERT INTO crash_cells (gy, gx, n, fatals, lat, lng)
+      SELECT CAST(lat * ${CELL_SCALE} AS INTEGER), CAST(lng * ${CELL_SCALE} AS INTEGER),
+             COUNT(*), COALESCE(SUM(fatals), 0), AVG(lat), AVG(lng)
+      FROM crashes GROUP BY 1, 2
+    `);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return db.prepare('SELECT COUNT(*) AS c FROM crash_cells').get().c;
+}
+
+// Build the grid once for databases that predate it.
+if (
+  db.prepare('SELECT COUNT(*) AS c FROM crash_cells').get().c === 0 &&
+  db.prepare('SELECT COUNT(*) AS c FROM crashes').get().c > 0
+) {
+  console.log('Building crash density grid…', rebuildCrashCells(), 'cells');
+}
+
+// `sample: true` (the map overlay) answers from the density grid when the view
+// holds more crashes than we'd draw, so cost tracks cells in view rather than
+// rows in view. Cell rows carry `n` as a heatmap weight. Zoomed in far enough
+// that the raw points fit, it returns the exact points instead.
+//
+// `sample: false` (hazard scoring) always reads raw rows: a thinned set would
+// undercount crashes near a route and skew the score.
+export function crashesInBbox({ minLat, minLng, maxLat, maxLng, limit = 3000, sample = false }) {
+  const box = [Number(minLat), Number(maxLat), Number(minLng), Number(maxLng)];
+  if (box.some((v) => !Number.isFinite(v))) return [];
+  const cap = Number(limit);
+  if (!sample) return bboxAllStmt.all(...box, cap);
+
+  const cells = cellsInBoxStmt.all(
+    Math.floor(box[0] * CELL_SCALE), Math.ceil(box[1] * CELL_SCALE),
+    Math.floor(box[2] * CELL_SCALE), Math.ceil(box[3] * CELL_SCALE)
+  );
+  // The grid doubles as a row counter, so deciding costs nothing extra.
+  const total = cells.reduce((sum, c) => sum + c.n, 0);
+  if (total <= cap) return bboxAllStmt.all(...box, cap);
+  return cells.map((c) => ({ lat: c.lat, lng: c.lng, fatals: c.fatals, weight: c.n, aggregated: true }));
 }
 
 export function crashStats() {

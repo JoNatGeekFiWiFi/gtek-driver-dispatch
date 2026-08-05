@@ -4,7 +4,7 @@
 // `arcgis` importer handles via a field mapping (no new code).
 
 import { db } from './db.js';
-import { ingestNhtsa } from './crashes.js';
+import { ingestNhtsa, rebuildCrashCells } from './crashes.js';
 
 const insertCrash = db.prepare(
   'INSERT INTO crashes (source, state, year, lat, lng, fatals, severity, crash_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -207,5 +207,8 @@ export async function runImport(sourceId, params) {
   if (!source) throw Object.assign(new Error(`Unknown crash source: ${sourceId}`), { status: 400 });
   // Idempotent re-imports: replace this source's rows rather than duplicating.
   db.prepare('DELETE FROM crashes WHERE source = ?').run(sourceId);
-  return source.run(params || {});
+  const result = await source.run(params || {});
+  // Keep the map's density grid in step with the rows it summarises.
+  rebuildCrashCells();
+  return result;
 }

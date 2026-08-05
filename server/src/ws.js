@@ -10,6 +10,7 @@ import { minDistToPolyline } from './crashes.js';
 const OFF_ROUTE_M = 150;
 const DB_WRITE_INTERVAL_MS = 15000;
 const HEARTBEAT_MS = 30000;
+const ROUTE_CACHE_TTL_MS = 30000; // self-heal if an invalidation is ever missed
 
 export function setupWs(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -17,6 +18,7 @@ export function setupWs(server) {
   const lastPos = new Map(); // driverId -> position payload
   const lastDbWrite = new Map(); // driverId -> timestamp
   const routeGeomCache = new Map(); // routeId -> projected polyline
+  const driverRouteCache = new Map(); // driverId -> { route, at }
 
   const activeRouteStmt = db.prepare(
     "SELECT id, geometry_json FROM routes WHERE driver_id = ? AND status IN ('assigned','in_progress') ORDER BY id DESC LIMIT 1"
@@ -24,6 +26,17 @@ export function setupWs(server) {
   const insertPos = db.prepare(
     'INSERT INTO positions (org_id, driver_id, route_id, lat, lng, speed, heading, accuracy) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   );
+
+  // Drivers send a fix every second or so; without this every one of them was
+  // a SELECT. Cached per driver and invalidated whenever their assignment or
+  // route status changes, with a TTL as a backstop.
+  function activeRouteFor(driverId) {
+    const hit = driverRouteCache.get(driverId);
+    if (hit && Date.now() - hit.at < ROUTE_CACHE_TTL_MS) return hit.route;
+    const route = activeRouteStmt.get(driverId) ?? null;
+    driverRouteCache.set(driverId, { route, at: Date.now() });
+    return route;
+  }
 
   function projectedRoute(routeId, geometryJson) {
     if (routeGeomCache.has(routeId)) return routeGeomCache.get(routeId);
@@ -99,8 +112,9 @@ export function setupWs(server) {
       if (msg.type === 'position' && user.role === 'driver') {
         const { lat, lng, speed, heading, accuracy } = msg;
         if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+        if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return;
 
-        const route = activeRouteStmt.get(user.uid);
+        const route = activeRouteFor(user.uid);
         let offRoute = null;
         if (route?.geometry_json) {
           const proj = projectedRoute(route.id, route.geometry_json);
@@ -148,6 +162,7 @@ export function setupWs(server) {
         if (!stillConnected) {
           lastPos.delete(user.uid);
           lastDbWrite.delete(user.uid);
+          driverRouteCache.delete(user.uid);
         }
         sendToOrg(user.org, { type: 'driver_offline', driverId: user.uid, name: user.name, ts: Date.now() }, 'dispatcher');
       }
@@ -162,6 +177,11 @@ export function setupWs(server) {
     },
     invalidateRoute(routeId) {
       routeGeomCache.delete(routeId);
+    },
+    // Call whenever a driver's assignment or route status changes so the next
+    // position fix re-reads instead of using a stale cached route.
+    invalidateDriver(driverId) {
+      if (driverId != null) driverRouteCache.delete(Number(driverId));
     },
     getLivePositions(org) {
       return [...lastPos.values()].filter((p) => p.org === org);

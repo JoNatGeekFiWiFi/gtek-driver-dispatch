@@ -120,8 +120,9 @@ export function walkMetrics(walk) {
       );
     }
   }
-  const onSiteS = (Number(walk.onSiteMin) || 0) * 60;
-  return { oneWayM, roundTripS: (oneWayM * 2) / WALK_SPEED_MPS + onSiteS };
+  // Time spent working at the site is the stop's own timeLimitMin, which
+  // computeSchedule adds separately — this is purely the walking.
+  return { oneWayM, roundTripS: (oneWayM * 2) / WALK_SPEED_MPS };
 }
 
 const EARTH_M = 111320;

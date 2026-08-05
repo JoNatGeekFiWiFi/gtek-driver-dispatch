@@ -79,7 +79,9 @@ function setCrashLayerNow(map, id, crashes) {
     features: crashes.map((c) => ({
       type: 'Feature',
       geometry: { type: 'Point', coordinates: [c.lng, c.lat] },
-      properties: { fatals: c.fatals || 0 },
+      // `weight` > 1 means this point is an aggregated density cell standing in
+      // for that many crashes (wide zooms); raw points weigh 1.
+      properties: { fatals: c.fatals || 0, weight: c.weight || 1 },
     })),
   };
   if (map.getSource(id)) {
@@ -93,7 +95,15 @@ function setCrashLayerNow(map, id, crashes) {
     source: id,
     maxzoom: 13,
     paint: {
-      'heatmap-weight': ['+', 1, ['*', 2, ['get', 'fatals']]],
+      // An aggregated cell stands in for `weight` crashes, but feeding that
+      // count in raw saturates the ramp instantly and the whole metro reads
+      // solid red. Square-root compression keeps a single raw point at exactly
+      // its old value (√1 = 1) while letting dense cells register as hotter,
+      // and the cap preserves contrast between "busy" and "worst".
+      'heatmap-weight': [
+        'min', 6,
+        ['+', ['^', ['get', 'weight'], 0.5], ['*', 2, ['get', 'fatals']]],
+      ],
       'heatmap-intensity': 0.6,
       'heatmap-radius': 22,
       'heatmap-opacity': 0.55,
