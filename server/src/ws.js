@@ -20,8 +20,10 @@ export function setupWs(server) {
   const routeGeomCache = new Map(); // routeId -> projected polyline
   const driverRouteCache = new Map(); // driverId -> { route, at }
 
+  // Queue order, matching /api/my-route: the driver's active route is the
+  // first one still open, not whichever was assigned most recently.
   const activeRouteStmt = db.prepare(
-    "SELECT id, geometry_json FROM routes WHERE driver_id = ? AND status IN ('assigned','in_progress') ORDER BY id DESC LIMIT 1"
+    "SELECT id, geometry_json FROM routes WHERE driver_id = ? AND status IN ('assigned','in_progress') ORDER BY queue_pos, id LIMIT 1"
   );
   const insertPos = db.prepare(
     'INSERT INTO positions (org_id, driver_id, route_id, lat, lng, speed, heading, accuracy) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'

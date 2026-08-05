@@ -34,7 +34,10 @@ db.exec(`
     name TEXT NOT NULL,
     driver_id INTEGER REFERENCES users(id),
     status TEXT NOT NULL DEFAULT 'draft'
-      CHECK (status IN ('draft','assigned','in_progress','completed')),
+      CHECK (status IN ('draft','assigned','in_progress','completed','cancelled')),
+    -- Position in a driver's queue. The active route is the lowest-numbered
+    -- one still open, so assigning doesn't silently jump the line.
+    queue_pos INTEGER NOT NULL DEFAULT 0,
     points_json TEXT NOT NULL,
     geometry_json TEXT,
     distance_m REAL,
@@ -107,6 +110,60 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_stop_events_route ON stop_events(route_id, ts);
 `);
+
+// ---- Migrations ----
+// SQLite can't ALTER a CHECK constraint, so widening `status` to allow
+// 'cancelled' (and adding queue_pos) means rebuilding the table. Guarded by
+// user_version so it runs exactly once per database.
+const SCHEMA_VERSION = 1;
+if (db.prepare('PRAGMA user_version').get().user_version < SCHEMA_VERSION) {
+  const cols = db.prepare('PRAGMA table_info(routes)').all().map((c) => c.name);
+  if (!cols.includes('queue_pos')) {
+    console.log('Migrating routes table (queue_pos + cancelled status)…');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE routes_migrated (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_id INTEGER NOT NULL REFERENCES orgs(id),
+          name TEXT NOT NULL,
+          driver_id INTEGER REFERENCES users(id),
+          status TEXT NOT NULL DEFAULT 'draft'
+            CHECK (status IN ('draft','assigned','in_progress','completed','cancelled')),
+          queue_pos INTEGER NOT NULL DEFAULT 0,
+          points_json TEXT NOT NULL,
+          geometry_json TEXT,
+          distance_m REAL,
+          duration_s REAL,
+          duration_traffic_s REAL,
+          hazard_score REAL,
+          hazard_count INTEGER,
+          provider TEXT,
+          scheduled_start TEXT,
+          started_at TEXT,
+          completed_at TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        );
+        INSERT INTO routes_migrated
+          (id, org_id, name, driver_id, status, points_json, geometry_json,
+           distance_m, duration_s, duration_traffic_s, hazard_score, hazard_count,
+           provider, scheduled_start, started_at, completed_at, created_at)
+        SELECT id, org_id, name, driver_id, status, points_json, geometry_json,
+           distance_m, duration_s, duration_traffic_s, hazard_score, hazard_count,
+           provider, scheduled_start, started_at, completed_at, created_at
+        FROM routes;
+        DROP TABLE routes;
+        ALTER TABLE routes_migrated RENAME TO routes;
+      `);
+      db.exec('COMMIT');
+      console.log('Migration complete.');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
 
 // GPS breadcrumbs accumulate forever otherwise — roughly 4M rows/month at 200
 // drivers. Keep a rolling window; 0 disables pruning if you need full history

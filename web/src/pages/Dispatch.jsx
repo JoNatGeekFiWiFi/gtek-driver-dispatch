@@ -23,6 +23,9 @@ export default function Dispatch() {
   const [plan, setPlan] = useState(null);
   const [planning, setPlanning] = useState(false);
   const [walkEdit, setWalkEdit] = useState(null); // { stopIndex, mode } while tracing a walk
+  // Set when the server reports DRIVER_BUSY: holds the conflict details plus
+  // the call to retry once the dispatcher picks replace or queue.
+  const [conflict, setConflict] = useState(null); // { details, retry, busy }
   const [routeName, setRouteName] = useState('');
   const [assignTo, setAssignTo] = useState('');
   const [msg, setMsg] = useState(null); // {kind:'error'|'success', text}
@@ -252,34 +255,67 @@ export default function Dispatch() {
     }
   }
 
+  // Wraps any assigning call: if the driver is already busy the server answers
+  // 409 instead of guessing, and we surface the choice rather than deciding.
+  async function withBusyPrompt(run, onDone) {
+    try {
+      const res = await run();
+      onDone(res, null);
+    } catch (err) {
+      if (err.code === 'DRIVER_BUSY') {
+        setConflict({
+          details: err.details,
+          retry: async (mode) => {
+            setConflict((c) => ({ ...c, busy: true }));
+            try {
+              const res = await run(mode);
+              setConflict(null);
+              onDone(res, mode);
+            } catch (e) {
+              setConflict(null);
+              setMsg({ kind: 'error', text: e.message });
+            }
+          },
+        });
+        return;
+      }
+      setMsg({ kind: 'error', text: err.message });
+    }
+  }
+
   async function saveRoute() {
     if (!routeName.trim()) {
       setMsg({ kind: 'error', text: 'Give the route a name first' });
       return;
     }
-    try {
-      await api('/api/routes', {
-        method: 'POST',
-        body: {
-          name: routeName.trim(),
-          points,
-          geometry: plan.geometry,
-          distanceM: plan.distanceM,
-          durationS: plan.durationS,
-          durationTrafficS: plan.durationTrafficS,
-          hazard: plan.hazard,
-          provider: plan.provider,
-          schedule: plan.schedule,
-          driverId: assignTo ? Number(assignTo) : null,
-          scheduledStart: plan.departAt,
-        },
+    const post = (mode) => api('/api/routes', {
+      method: 'POST',
+      body: {
+        name: routeName.trim(),
+        points,
+        geometry: plan.geometry,
+        distanceM: plan.distanceM,
+        durationS: plan.durationS,
+        durationTrafficS: plan.durationTrafficS,
+        hazard: plan.hazard,
+        provider: plan.provider,
+        schedule: plan.schedule,
+        driverId: assignTo ? Number(assignTo) : null,
+        scheduledStart: plan.departAt,
+        mode,
+      },
+    });
+    await withBusyPrompt(post, (res, mode) => {
+      setMsg({
+        kind: 'success',
+        text: !assignTo ? 'Route saved as draft'
+          : mode === 'queue' ? `Route saved and queued (position ${res.queuedBehind + 1})`
+          : mode === 'replace' ? 'Route saved and assigned — previous route cancelled'
+          : 'Route saved and assigned',
       });
-      setMsg({ kind: 'success', text: assignTo ? 'Route saved and assigned' : 'Route saved as draft' });
       setRouteName('');
       refreshRoutes();
-    } catch (err) {
-      setMsg({ kind: 'error', text: err.message });
-    }
+    });
   }
 
   function clearBuilder() {
@@ -587,8 +623,19 @@ export default function Dispatch() {
                         onClick={async () => {
                           const sel = document.getElementById(`assign-${r.id}`);
                           if (!sel.value) return;
-                          await api(`/api/routes/${r.id}/assign`, { method: 'POST', body: { driverId: Number(sel.value) } });
-                          refreshRoutes();
+                          const driverId = Number(sel.value);
+                          await withBusyPrompt(
+                            (mode) => api(`/api/routes/${r.id}/assign`, { method: 'POST', body: { driverId, mode } }),
+                            (res, mode) => {
+                              setMsg({
+                                kind: 'success',
+                                text: mode === 'queue' ? `Queued at position ${res.queuedBehind + 1}`
+                                  : mode === 'replace' ? 'Assigned — previous route cancelled'
+                                  : 'Route assigned',
+                              });
+                              refreshRoutes();
+                            }
+                          );
                         }}
                       >Assign</button>
                     </div>
@@ -692,6 +739,41 @@ export default function Dispatch() {
         </div>
         <div ref={mapEl} className="map" />
       </main>
+
+      {conflict && (
+        <div className="modal-backdrop" onClick={() => !conflict.busy && setConflict(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>{conflict.details?.driverName || 'This driver'} already has work</h3>
+            <p className="muted" style={{ fontSize: 13 }}>
+              Currently {conflict.details?.open?.[0]?.status === 'in_progress' ? 'driving' : 'assigned'}:
+            </p>
+            <ul className="conflict-list">
+              {conflict.details?.open?.map((r) => (
+                <li key={r.id}>
+                  <b>{r.name}</b>
+                  <span className={`chip ${r.status}`}>{r.status.replace('_', ' ')}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="muted" style={{ fontSize: 13 }}>What should happen to the new route?</p>
+            <div className="modal-actions">
+              <button className="btn primary" disabled={conflict.busy} onClick={() => conflict.retry('queue')}>
+                Queue it after
+                <span className="btn-sub">Driver finishes current work first</span>
+              </button>
+              <button className="btn danger" disabled={conflict.busy} onClick={() => conflict.retry('replace')}>
+                Switch to it now
+                <span className="btn-sub">
+                  Cancels {conflict.details?.open?.length > 1 ? `${conflict.details.open.length} routes` : 'the current route'}
+                </span>
+              </button>
+            </div>
+            <button className="btn link" disabled={conflict.busy} onClick={() => setConflict(null)}>
+              Never mind
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

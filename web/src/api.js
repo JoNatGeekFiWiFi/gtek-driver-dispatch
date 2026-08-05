@@ -38,7 +38,15 @@ export async function api(path, opts = {}) {
   try {
     data = await res.json();
   } catch { /* non-JSON error body */ }
-  if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    // Carry the server's machine-readable context (e.g. DRIVER_BUSY) so callers
+    // can react to a specific condition rather than string-matching a message.
+    const err = new Error(data?.error || `Request failed (${res.status})`);
+    err.status = res.status;
+    err.code = data?.code;
+    err.details = data?.details;
+    throw err;
+  }
   return data;
 }
 

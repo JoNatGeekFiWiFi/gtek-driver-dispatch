@@ -40,6 +40,7 @@ export default function Driver() {
   const [departed, setDeparted] = useState({});
   const [walkDone, setWalkDone] = useState({}); // { stopIndex: true } walk finished
   const [walkPhase, setWalkPhase] = useState(null); // { stopIndex, phase:'out'|'back' }
+  const [upNext, setUpNext] = useState([]); // routes queued behind this one
   const [follow, setFollow] = useState(true);
   const [behindPicker, setBehindPicker] = useState(false);
   const [behindMin, setBehindMin] = useState(0); // schedule-derived delay, live
@@ -66,8 +67,9 @@ export default function Driver() {
 
   const loadRoute = useCallback(async () => {
     try {
-      const { route } = await api('/api/my-route');
+      const { route, upNext } = await api('/api/my-route');
       setRoute(route);
+      setUpNext(upNext || []);
       if (route?.id) {
         const { events } = await api(`/api/routes/${route.id}/progress`);
         const arr = {}, dep = {}, wd = {};
@@ -415,6 +417,12 @@ export default function Driver() {
                 );
               })}
             </ol>
+
+            {upNext.length > 0 && (
+              <div className="up-next">
+                Up next after this: {upNext.map((r) => r.name).join(', ')}
+              </div>
+            )}
 
             {behindPicker ? (
               <div className="behind-picker">

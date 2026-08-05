@@ -103,7 +103,10 @@ function sendError(res, err) {
   const status = err.status || 500;
   if (status === 500) console.error(err);
   if (res.headersSent) return;
-  res.status(status).json({ error: status === 500 ? 'Server error' : err.message || 'Server error' });
+  const body = { error: status === 500 ? 'Server error' : err.message || 'Server error' };
+  if (err.code) body.code = err.code;          // machine-readable, e.g. DRIVER_BUSY
+  if (err.details) body.details = err.details; // structured context for the UI
+  res.status(status).json(body);
 }
 
 // ---- Auth ----
@@ -137,6 +140,44 @@ function assertDriverInOrg(orgId, driverId) {
     .prepare("SELECT id FROM users WHERE id = ? AND org_id = ? AND role = 'driver'")
     .get(Number(driverId), orgId);
   if (!d) throw Object.assign(new Error('That driver is not in your organization'), { status: 400 });
+}
+
+const openRoutesStmt = db.prepare(
+  `SELECT id, name, status, queue_pos FROM routes
+   WHERE org_id = ? AND driver_id = ? AND status IN ('assigned','in_progress')
+   ORDER BY queue_pos, id`
+);
+
+// Assigning to a driver who already has work is ambiguous: replace what they
+// have, or line up behind it? Rather than guess, refuse with 409 + the current
+// queue and let the dispatcher choose. `mode` then says which they picked.
+function planAssignment(orgId, driverId, mode, excludeRouteId = null) {
+  const open = openRoutesStmt.all(orgId, Number(driverId))
+    .filter((r) => r.id !== excludeRouteId);
+  if (!open.length) return { queuePos: 0, cancel: [] };
+
+  if (!mode) {
+    const driver = db.prepare('SELECT name FROM users WHERE id = ?').get(Number(driverId));
+    throw Object.assign(new Error(`${driver?.name || 'That driver'} already has a route in progress`), {
+      status: 409,
+      code: 'DRIVER_BUSY',
+      details: { driverId: Number(driverId), driverName: driver?.name ?? null, open },
+    });
+  }
+  if (mode === 'replace') return { queuePos: 0, cancel: open.map((r) => r.id) };
+  if (mode === 'queue') return { queuePos: Math.max(...open.map((r) => r.queue_pos)) + 1, cancel: [] };
+  throw Object.assign(new Error("mode must be 'replace' or 'queue'"), { status: 400 });
+}
+
+// Cancel routes the dispatcher chose to replace, and tell the driver's app.
+function cancelRoutes(orgId, ids, driverId) {
+  if (!ids?.length) return;
+  const stmt = db.prepare("UPDATE routes SET status = 'cancelled' WHERE id = ? AND org_id = ?");
+  for (const id of ids) {
+    stmt.run(id, orgId);
+    wsHub.invalidateRoute(id);
+    wsHub.notifyOrg(orgId, { type: 'route_status', routeId: id, status: 'cancelled', driverId });
+  }
 }
 
 // ---- Drivers (dispatcher) ----
@@ -185,10 +226,16 @@ app.post('/api/walk/route', authRequired, roleRequired('dispatcher'), wrap(async
 app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
   const {
     name, points, geometry, distanceM, durationS, durationTrafficS,
-    hazard, provider, driverId, scheduledStart, schedule,
+    hazard, provider, driverId, scheduledStart, schedule, mode,
   } = req.body;
   if (!name || !points?.length) throw Object.assign(new Error('Route name and points are required'), { status: 400 });
-  if (driverId) assertDriverInOrg(req.user.org, driverId);
+  let placement = { queuePos: 0, cancel: [] };
+  if (driverId) {
+    assertDriverInOrg(req.user.org, driverId);
+    // Throws 409 DRIVER_BUSY when the driver already has work and the
+    // dispatcher hasn't said whether to replace it or queue behind it.
+    placement = planAssignment(req.user.org, driverId, mode);
+  }
   // Fold the planned schedule into each stop so points_json is self-contained
   // (driver and dispatcher read planned times straight off the stops).
   const enrichedPoints = points.map((p, i) => ({
@@ -200,21 +247,22 @@ app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res
   }));
   const status = driverId ? 'assigned' : 'draft';
   const result = db.prepare(`
-    INSERT INTO routes (org_id, name, driver_id, status, points_json, geometry_json,
+    INSERT INTO routes (org_id, name, driver_id, status, queue_pos, points_json, geometry_json,
       distance_m, duration_s, duration_traffic_s, hazard_score, hazard_count, provider, scheduled_start)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    req.user.org, name, driverId || null, status, JSON.stringify(enrichedPoints),
+    req.user.org, name, driverId || null, status, placement.queuePos, JSON.stringify(enrichedPoints),
     geometry ? JSON.stringify(geometry) : null, distanceM ?? null, durationS ?? null,
     durationTrafficS ?? null, hazard?.score ?? null, hazard?.count ?? null,
     provider ?? null, scheduledStart ?? null
   );
   const route = getRoute(req.user.org, result.lastInsertRowid);
   if (driverId) {
+    cancelRoutes(req.user.org, placement.cancel, driverId);
     wsHub.invalidateDriver(driverId);
     wsHub.notifyOrg(req.user.org, { type: 'route_assigned', routeId: route.id, driverId });
   }
-  res.json({ route });
+  res.json({ route, queuedBehind: placement.queuePos, cancelled: placement.cancel });
 }));
 
 app.get('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
@@ -228,17 +276,22 @@ app.get('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res)
 
 app.post('/api/routes/:id/assign', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
   const id = Number(req.params.id);
-  const { driverId } = req.body;
+  const { driverId, mode } = req.body;
   const route = getRoute(req.user.org, id);
   if (!route) throw Object.assign(new Error('Route not found'), { status: 404 });
   assertDriverInOrg(req.user.org, driverId);
-  db.prepare("UPDATE routes SET driver_id = ?, status = 'assigned' WHERE id = ? AND org_id = ?")
-    .run(driverId, id, req.user.org);
+  // Exclude this route from the busy check — reassigning a driver's own route
+  // to themselves shouldn't count as a conflict with itself.
+  const placement = planAssignment(req.user.org, driverId, mode, id);
+
+  db.prepare("UPDATE routes SET driver_id = ?, status = 'assigned', queue_pos = ? WHERE id = ? AND org_id = ?")
+    .run(driverId, placement.queuePos, id, req.user.org);
+  cancelRoutes(req.user.org, placement.cancel, driverId);
   wsHub.invalidateRoute(id);
   wsHub.invalidateDriver(driverId);
   wsHub.invalidateDriver(route.driver_id); // the driver it was taken away from
   wsHub.notifyOrg(req.user.org, { type: 'route_assigned', routeId: id, driverId });
-  res.json({ route: getRoute(req.user.org, id) });
+  res.json({ route: getRoute(req.user.org, id), queuedBehind: placement.queuePos, cancelled: placement.cancel });
 }));
 
 app.post('/api/routes/:id/status', authRequired, wrap((req, res) => {
@@ -344,11 +397,16 @@ app.get('/api/routes/:id/progress', authRequired, wrap((req, res) => {
 }));
 
 app.get('/api/my-route', authRequired, roleRequired('driver'), wrap((req, res) => {
-  const row = db.prepare(`
+  // First in the queue, not the newest — a route assigned later lines up
+  // behind rather than silently taking over.
+  const open = db.prepare(`
     SELECT * FROM routes WHERE org_id = ? AND driver_id = ?
-    AND status IN ('assigned','in_progress') ORDER BY id DESC LIMIT 1
-  `).get(req.user.org, req.user.uid);
-  res.json({ route: row ? parseRouteRow(row) : null });
+    AND status IN ('assigned','in_progress') ORDER BY queue_pos, id
+  `).all(req.user.org, req.user.uid);
+  res.json({
+    route: open.length ? parseRouteRow(open[0]) : null,
+    upNext: open.slice(1).map((r) => ({ id: r.id, name: r.name, scheduledStart: r.scheduled_start })),
+  });
 }));
 
 function getRoute(orgId, id) {
