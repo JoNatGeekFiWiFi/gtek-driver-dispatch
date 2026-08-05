@@ -5,15 +5,20 @@ import { createMap, setLineLayer, makeMarker, setStopMarkers, setWalkPaths } fro
 import { watchPosition, isNativeApp } from '../geo.js';
 
 const ARRIVE_RADIUS_M = 120; // auto-mark arrived within this distance of a stop
+const DEPART_RADIUS_M = 180; // pulled away this far after arriving => departed
+                             // (deliberately wider than ARRIVE so GPS jitter
+                             //  can't flap a parked driver in and out)
 const WALK_ARRIVE_M = 25;    // tighter radius for reaching a walk point on foot
 const BEHIND_GRACE_MIN = 5;  // auto-flag behind once this many minutes past plan
 
-// A stop counts as complete for advancement when the driver has arrived
-// (parked) — or, for a walking stop, when the walk out-and-back is done.
-function stopComplete(i, pts, arrived, walkDone) {
+// A stop is finished — and the driver advances to the next one — on DEPARTURE,
+// not arrival. Completing on arrival would make the stop's dwell time limit
+// unmeasurable (and hide the Depart button the moment it became relevant).
+// Walking stops finish when the out-and-back walk is done.
+function stopComplete(i, pts, arrived, walkDone, departed) {
   if (i === 0) return true;
   if (pts[i]?.walk?.geometry) return Boolean(walkDone[i]);
-  return Boolean(arrived[i]);
+  return Boolean(departed?.[i]);
 }
 
 export default function Driver() {
@@ -42,12 +47,14 @@ export default function Driver() {
   // Refs the GPS callback / interval read (they close over first render).
   const routeRef = useRef(null);
   const arrivedRef = useRef({});
+  const departedRef = useRef({});
   const walkDoneRef = useRef({});
   const walkPhaseRef = useRef(null);
   const behindFlaggedRef = useRef({});
   const followRef = useRef(true);
   useEffect(() => { routeRef.current = route; }, [route]);
   useEffect(() => { arrivedRef.current = arrived; }, [arrived]);
+  useEffect(() => { departedRef.current = departed; }, [departed]);
   useEffect(() => { walkDoneRef.current = walkDone; }, [walkDone]);
   useEffect(() => { walkPhaseRef.current = walkPhase; }, [walkPhase]);
   useEffect(() => { followRef.current = follow; }, [follow]);
@@ -55,7 +62,7 @@ export default function Driver() {
   const stops = route?.points || [];
   const lastIdx = stops.length - 1;
   // Next stop the driver is heading to: first not-yet-complete stop.
-  const targetIdx = stops.findIndex((_, i) => i >= 1 && !stopComplete(i, stops, arrived, walkDone));
+  const targetIdx = stops.findIndex((_, i) => i >= 1 && !stopComplete(i, stops, arrived, walkDone, departed));
 
   const loadRoute = useCallback(async () => {
     try {
@@ -71,10 +78,11 @@ export default function Driver() {
         setArrived(arr);
         setDeparted(dep);
         setWalkDone(wd);
-        arrivedRef.current = arr; walkDoneRef.current = wd;
+        arrivedRef.current = arr; departedRef.current = dep; walkDoneRef.current = wd;
         behindFlaggedRef.current = {};
       } else {
         setArrived({}); setDeparted({}); setWalkDone({}); setWalkPhase(null);
+        arrivedRef.current = {}; departedRef.current = {}; walkDoneRef.current = {};
       }
     } catch { /* retried on next ws event */ }
   }, []);
@@ -145,7 +153,7 @@ export default function Driver() {
     const r = routeRef.current;
     const pts = r?.points;
     if (pts) {
-      const tIdx = pts.findIndex((_, i) => i >= 1 && !stopComplete(i, pts, arrivedRef.current, walkDoneRef.current));
+      const tIdx = pts.findIndex((_, i) => i >= 1 && !stopComplete(i, pts, arrivedRef.current, walkDoneRef.current, departedRef.current));
       if (tIdx >= 1) {
         const s = pts[tIdx];
         const atStop = haversineM(lat, lng, s.lat, s.lng);
@@ -161,8 +169,12 @@ export default function Driver() {
               finishWalk(tIdx);
             }
           }
-        } else if (atStop <= ARRIVE_RADIUS_M && !arrivedRef.current[tIdx]) {
-          markArrived(tIdx, true);
+        } else if (!arrivedRef.current[tIdx]) {
+          if (atStop <= ARRIVE_RADIUS_M) markArrived(tIdx, true);
+        } else if (atStop > DEPART_RADIUS_M && tIdx < pts.length - 1) {
+          // Pulled away from the stop → the visit is over. (Not for the final
+          // stop, which stays current until the driver completes the route.)
+          markDeparted(tIdx, true);
         }
       }
     }
@@ -178,9 +190,12 @@ export default function Driver() {
     if (routeRef.current?.points?.[i]?.walk?.geometry) startWalk(i);
   }
 
-  function markDeparted(i) {
-    setDeparted((d) => ({ ...d, [i]: Date.now() }));
-    postStopEvent(i, 'departed', { auto: false });
+  function markDeparted(i, auto = false) {
+    if (departedRef.current[i]) return;
+    const now = Date.now();
+    departedRef.current = { ...departedRef.current, [i]: now };
+    setDeparted((d) => ({ ...d, [i]: now }));
+    postStopEvent(i, 'departed', { auto });
   }
 
   // ---- walking sub-path phases ----
@@ -219,15 +234,33 @@ export default function Driver() {
     const iv = setInterval(() => {
       const r = routeRef.current;
       if (!r?.points) return;
-      const tIdx = r.points.findIndex((_, i) => i >= 1 && !stopComplete(i, r.points, arrivedRef.current, walkDoneRef.current));
+      const pts = r.points;
+      const tIdx = pts.findIndex((_, i) => i >= 1 && !stopComplete(i, pts, arrivedRef.current, walkDoneRef.current, departedRef.current));
       if (tIdx < 1) { setBehindMin(0); return; }
-      const planned = r.points[tIdx].plannedArrival;
-      if (!planned) return;
-      const late = (Date.now() - new Date(planned).getTime()) / 60000;
+      const s = pts[tIdx];
+      const parked = arrivedRef.current[tIdx];
+
+      // Before arriving we measure lateness against the planned arrival; once
+      // parked we measure the stop's own time limit instead — otherwise a
+      // driver who arrived exactly on time would be flagged the moment the
+      // planned arrival passed. Stops with no limit can't be overstayed.
+      let target = null, key = null, overstay = false;
+      if (!parked) {
+        target = s.plannedArrival; key = `${tIdx}:arrive`;
+      } else if (s.timeLimitMin || s.walk?.geometry) {
+        target = s.plannedDeparture; key = `${tIdx}:depart`; overstay = true;
+      }
+      if (!target) { setBehindMin(0); return; }
+
+      const late = (Date.now() - new Date(target).getTime()) / 60000;
       setBehindMin(Math.max(0, Math.round(late)));
-      if (late > BEHIND_GRACE_MIN && !behindFlaggedRef.current[tIdx]) {
-        behindFlaggedRef.current[tIdx] = true;
-        postStopEvent(tIdx, 'behind', { auto: true, delayMin: Math.round(late) });
+      if (late > BEHIND_GRACE_MIN && !behindFlaggedRef.current[key]) {
+        behindFlaggedRef.current[key] = true;
+        postStopEvent(tIdx, 'behind', {
+          auto: true,
+          delayMin: Math.round(late),
+          note: overstay ? 'over the time limit at this stop' : null,
+        });
       }
     }, 20000);
     return () => clearInterval(iv);
@@ -282,6 +315,8 @@ export default function Driver() {
   }
 
   const behind = behindMin > BEHIND_GRACE_MIN;
+  // Parked at the current stop and past its limit == overstaying, not "late".
+  const overstaying = behind && targetIdx >= 1 && Boolean(arrived[targetIdx]) && !departed[targetIdx];
 
   return (
     <div className="driver-app">
@@ -305,7 +340,11 @@ export default function Driver() {
               🚶 {walkPhase.phase === 'out' ? 'Walking to the site' : 'Returning to the vehicle'} — dispatch can see your progress
             </div>
           ) : behind ? (
-            <div className="banner warn">⚠ Running ~{behindMin} min behind schedule — dispatch has been alerted</div>
+            <div className="banner warn">
+              {overstaying
+                ? `⚠ ~${behindMin} min over the time limit at this stop — dispatch has been alerted`
+                : `⚠ Running ~${behindMin} min behind schedule — dispatch has been alerted`}
+            </div>
           ) : offRoute ? (
             <div className="banner warn">⚠ You appear to be off route — dispatch can see this</div>
           ) : (
@@ -333,7 +372,7 @@ export default function Driver() {
               {stops.map((s, i) => {
                 const isStart = i === 0, isEnd = i === lastIdx;
                 const hasWalk = Boolean(s.walk?.geometry);
-                const done = isStart || stopComplete(i, stops, arrived, walkDone);
+                const done = isStart || stopComplete(i, stops, arrived, walkDone, departed);
                 const current = i === targetIdx;
                 const walkM = hasWalk ? Math.round(s.walk.oneWayM || walkOneWayM(s.walk.geometry)) : 0;
                 const late = arrived[i] && s.plannedArrival
@@ -352,6 +391,7 @@ export default function Driver() {
                         {hasWalk ? ` · walk ~${walkRoundTripMin(s.walk.oneWayM || walkOneWayM(s.walk.geometry))}m` : (s.timeLimitMin ? ` · ${s.timeLimitMin}m` : '')}
                         {s.deadline ? ` · by ${s.deadline}` : ''}
                         {arrived[i] && !isStart ? ` · ${late ? '⚠ ' : '✓ '}parked ${fmtClock(new Date(arrived[i]).toISOString())}` : ''}
+                        {arrived[i] && departed[i] ? ` · ${Math.max(1, Math.round((departed[i] - arrived[i]) / 60000))}m here` : ''}
                       </span>
                       {phase && (
                         <span className={`walk-phase ${phase}`}>

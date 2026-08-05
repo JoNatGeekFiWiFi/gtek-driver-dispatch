@@ -2,6 +2,20 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { db } from './db.js';
 
+// Tokens are only as secret as this key. The dev fallback is public (it's in
+// the repo), so a production boot without a real secret means anyone can forge
+// a token for any user in any org — refuse to start rather than fail silently.
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  console.error(
+    'FATAL: JWT_SECRET must be set in production.\n' +
+    'Generate one with:  node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"'
+  );
+  process.exit(1);
+}
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠  JWT_SECRET not set — using the public dev fallback. Do not use this in production.');
+}
+
 export const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
 export function signToken(user) {

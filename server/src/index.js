@@ -33,12 +33,23 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 const wsHub = setupWs(server);
 
-const wrap = (fn) => (req, res) =>
-  Promise.resolve(fn(req, res)).catch((err) => {
-    const status = err.status || 500;
-    if (status === 500) console.error(err);
-    res.status(status).json({ error: err.message || 'Server error' });
-  });
+// `async` matters: a plain `Promise.resolve(fn())` lets a SYNCHRONOUS throw
+// escape before .catch is attached, so Express renders its default HTML error
+// page — leaking server file paths and breaking clients that expect JSON.
+const wrap = (fn) => async (req, res) => {
+  try {
+    await fn(req, res);
+  } catch (err) {
+    sendError(res, err);
+  }
+};
+
+function sendError(res, err) {
+  const status = err.status || 500;
+  if (status === 500) console.error(err);
+  if (res.headersSent) return;
+  res.status(status).json({ error: status === 500 ? 'Server error' : err.message || 'Server error' });
+}
 
 // ---- Auth ----
 app.post('/api/auth/register', wrap((req, res) => {
@@ -55,6 +66,15 @@ app.get('/api/me', authRequired, (req, res) => res.json({ user: req.user }));
 
 function publicUser(u) {
   return { id: u.id, name: u.name, email: u.email, role: u.role, orgId: u.org_id };
+}
+
+// Routes may only be assigned to a driver in the caller's own organization.
+// Without this a dispatcher could point a route at another tenant's user id.
+function assertDriverInOrg(orgId, driverId) {
+  const d = db
+    .prepare("SELECT id FROM users WHERE id = ? AND org_id = ? AND role = 'driver'")
+    .get(Number(driverId), orgId);
+  if (!d) throw Object.assign(new Error('That driver is not in your organization'), { status: 400 });
 }
 
 // ---- Drivers (dispatcher) ----
@@ -74,7 +94,8 @@ app.post('/api/drivers', authRequired, roleRequired('dispatcher'), wrap((req, re
 
 app.get('/api/drivers/:id/trail', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
   const rows = db
-    .prepare('SELECT lat, lng, ts FROM positions WHERE org_id = ? AND driver_id = ? ORDER BY ts DESC LIMIT 500')
+    .prepare(`SELECT lat, lng, CAST(strftime('%s', ts) AS INTEGER) * 1000 AS ts
+              FROM positions WHERE org_id = ? AND driver_id = ? ORDER BY ts DESC LIMIT 500`)
     .all(req.user.org, Number(req.params.id));
   res.json({ trail: rows.reverse() });
 }));
@@ -105,6 +126,7 @@ app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res
     hazard, provider, driverId, scheduledStart, schedule,
   } = req.body;
   if (!name || !points?.length) throw Object.assign(new Error('Route name and points are required'), { status: 400 });
+  if (driverId) assertDriverInOrg(req.user.org, driverId);
   // Fold the planned schedule into each stop so points_json is self-contained
   // (driver and dispatcher read planned times straight off the stops).
   const enrichedPoints = points.map((p, i) => ({
@@ -133,7 +155,7 @@ app.post('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res
 app.get('/api/routes', authRequired, roleRequired('dispatcher'), wrap((req, res) => {
   const rows = db.prepare(`
     SELECT r.*, u.name AS driver_name FROM routes r
-    LEFT JOIN users u ON u.id = r.driver_id
+    LEFT JOIN users u ON u.id = r.driver_id AND u.org_id = r.org_id
     WHERE r.org_id = ? ORDER BY r.id DESC LIMIT 100
   `).all(req.user.org);
   res.json({ routes: rows.map(parseRouteRow) });
@@ -144,6 +166,7 @@ app.post('/api/routes/:id/assign', authRequired, roleRequired('dispatcher'), wra
   const { driverId } = req.body;
   const route = getRoute(req.user.org, id);
   if (!route) throw Object.assign(new Error('Route not found'), { status: 404 });
+  assertDriverInOrg(req.user.org, driverId);
   db.prepare("UPDATE routes SET driver_id = ?, status = 'assigned' WHERE id = ? AND org_id = ?")
     .run(driverId, id, req.user.org);
   wsHub.invalidateRoute(id);
@@ -241,9 +264,14 @@ app.get('/api/routes/:id/progress', authRequired, wrap((req, res) => {
   if (req.user.role === 'driver' && route.driver_id !== req.user.uid) {
     throw Object.assign(new Error('Not your route'), { status: 403 });
   }
-  const events = db.prepare(
-    'SELECT stop_index AS stopIndex, kind, auto, delay_min AS delayMin, note, ts FROM stop_events WHERE route_id = ? ORDER BY id'
-  ).all(id);
+  // ts is stored as UTC text by datetime('now'); return epoch ms so clients
+  // never have to guess the timezone (a bare "YYYY-MM-DD HH:MM:SS" parses as
+  // LOCAL time in JS, which silently shifted displayed times).
+  const events = db.prepare(`
+    SELECT stop_index AS stopIndex, kind, auto, delay_min AS delayMin, note,
+           CAST(strftime('%s', ts) AS INTEGER) * 1000 AS ts
+    FROM stop_events WHERE route_id = ? ORDER BY id
+  `).all(id);
   res.json({ events, stops: route.points });
 }));
 
@@ -300,6 +328,10 @@ if (fs.existsSync(distDir)) {
   app.use(express.static(distDir));
   app.get(/^\/(?!api|ws).*/, (req, res) => res.sendFile(path.join(distDir, 'index.html')));
 }
+
+// Safety net: anything that still reaches Express's error path answers in JSON
+// rather than an HTML stack trace.
+app.use((err, req, res, _next) => sendError(res, err));
 
 server.listen(PORT, () => {
   console.log(`Dispatch server running on http://localhost:${PORT}`);

@@ -9,6 +9,7 @@ import { minDistToPolyline } from './crashes.js';
 
 const OFF_ROUTE_M = 150;
 const DB_WRITE_INTERVAL_MS = 15000;
+const HEARTBEAT_MS = 30000;
 
 export function setupWs(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -53,6 +54,21 @@ export function setupWs(server) {
     }
   }
 
+  // A phone that dies or loses signal leaves a half-open socket: 'close' never
+  // fires, so the driver would look permanently "live" to dispatch. Ping every
+  // client and drop the ones that stop answering.
+  const heartbeat = setInterval(() => {
+    for (const [ws] of clients) {
+      if (ws.isAlive === false) {
+        ws.terminate(); // fires 'close' → cleanup + driver_offline
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch { /* socket already gone */ }
+    }
+  }, HEARTBEAT_MS);
+  wss.on('close', () => clearInterval(heartbeat));
+
   wss.on('connection', (ws, req) => {
     let user;
     try {
@@ -63,6 +79,8 @@ export function setupWs(server) {
       return;
     }
     clients.set(ws, user);
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     // New dispatcher connections get a snapshot of current driver positions.
     if (user.role === 'dispatcher') {
@@ -124,6 +142,13 @@ export function setupWs(server) {
     ws.on('close', () => {
       clients.delete(ws);
       if (user.role === 'driver') {
+        // Drop the last known position too — otherwise /api/drivers keeps
+        // reporting a stale fix as this driver's "live" location.
+        const stillConnected = [...clients.values()].some((u) => u.uid === user.uid);
+        if (!stillConnected) {
+          lastPos.delete(user.uid);
+          lastDbWrite.delete(user.uid);
+        }
         sendToOrg(user.org, { type: 'driver_offline', driverId: user.uid, name: user.name, ts: Date.now() }, 'dispatcher');
       }
     });
